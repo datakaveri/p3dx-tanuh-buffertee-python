@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	cryptosha256 "crypto/sha256"
@@ -9,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -18,6 +18,7 @@ import (
 
 	"github.com/datakaveri/tanuh-buffer-tee/internal/bundle"
 	hpkepkg "github.com/datakaveri/tanuh-buffer-tee/internal/hpke"
+	"github.com/datakaveri/tanuh-buffer-tee/internal/jobs"
 )
 
 const (
@@ -27,13 +28,63 @@ const (
 )
 
 // JobRequest is the small HPKE-encrypted metadata payload.
-// Model bytes are NOT included — they are uploaded separately via /v1/upload.
-// SHA256 hashes commit to the files before they arrive (prevents in-transit swaps).
+// Model bytes are NOT included — they are uploaded separately via
+// PUT /v1/upload/{job_id}/{slot}. SHA256 hashes commit to the files before
+// they arrive (prevents in-transit swaps); an upload is accepted only if it
+// matches its committed hash.
 type JobRequest struct {
-	DatasetID           int    `json:"dataset_id"`               // 1, 2, or 3
-	ModelSHA256         string `json:"model_sha256"`             // hex SHA256 of model.onnx plaintext
-	WeightsSHA256       string `json:"weights_sha256"`           // hex SHA256 of weights plaintext
-	PreprocessingSHA256 string `json:"preprocessing_sha256,omitempty"` // hex SHA256 of preprocessing.py (dataset_id=2)
+	DatasetID     string `json:"dataset_id"`               // catalogue dataset UUID (passed through)
+	ModelFormat   string `json:"model_format"`             // onnx | torchscript | huggingface
+	ModelSHA256   string `json:"model_sha256"`             // .onnx / TorchScript .pt / Hugging Face .zip
+	WeightsSHA256 string `json:"weights_sha256,omitempty"` // ONNX external weights (.onnx.data), optional
+	AdaptorSHA256 string `json:"adaptor_sha256"`           // adaptor.py
+	// InputSpecSHA256 commits to an optional input_spec.json (ONNX /
+	// TorchScript input size and resize method).
+	InputSpecSHA256 string `json:"input_spec_sha256,omitempty"`
+}
+
+// validate checks the commitments against the model format so a job that can
+// never be dispatched is refused at submit rather than failing later.
+func (r *JobRequest) validate() error {
+	if !jobs.ValidFormat(r.ModelFormat) {
+		return fmt.Errorf("model_format must be one of onnx, torchscript, huggingface (got %q)", r.ModelFormat)
+	}
+	r.ModelSHA256 = strings.ToLower(strings.TrimSpace(r.ModelSHA256))
+	r.WeightsSHA256 = strings.ToLower(strings.TrimSpace(r.WeightsSHA256))
+	r.AdaptorSHA256 = strings.ToLower(strings.TrimSpace(r.AdaptorSHA256))
+	if !isSHA256Hex(r.ModelSHA256) {
+		return fmt.Errorf("model_sha256 must be a 64-character hex SHA-256")
+	}
+	if !isSHA256Hex(r.AdaptorSHA256) {
+		return fmt.Errorf("adaptor_sha256 must be a 64-character hex SHA-256")
+	}
+	if r.WeightsSHA256 != "" {
+		if r.ModelFormat != jobs.FormatONNX {
+			return fmt.Errorf("weights_sha256 is only used with model_format onnx")
+		}
+		if !isSHA256Hex(r.WeightsSHA256) {
+			return fmt.Errorf("weights_sha256 must be a 64-character hex SHA-256")
+		}
+	}
+	r.InputSpecSHA256 = strings.ToLower(strings.TrimSpace(r.InputSpecSHA256))
+	if r.InputSpecSHA256 != "" {
+		if r.ModelFormat == jobs.FormatHuggingFace {
+			return fmt.Errorf("input_spec_sha256 is only used with onnx and torchscript " +
+				"(Hugging Face models use their preprocessor_config.json)")
+		}
+		if !isSHA256Hex(r.InputSpecSHA256) {
+			return fmt.Errorf("input_spec_sha256 must be a 64-character hex SHA-256")
+		}
+	}
+	return nil
+}
+
+func isSHA256Hex(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(s)
+	return err == nil
 }
 
 // extractKeycloakSub decodes the JWT payload (already validated by middleware)
@@ -59,9 +110,9 @@ func extractKeycloakSub(tokenStr string) string {
 // ChunkedUploadHeader is Frame 0 of the AES-256-GCM-CHUNKED-v1 stream.
 type ChunkedUploadHeader struct {
 	FileID          string `json:"file_id"`
-	Enc             string `json:"enc"`              // base64std HPKE encapsulated key (32 bytes)
-	WrappedKey      string `json:"wrapped_key"`      // base64std HPKE-wrapped AES-256 key (48 bytes)
-	BaseIV          string `json:"base_iv"`          // base64std 12-byte base IV; chunk i uses BaseIV+i (96-bit big-endian)
+	Enc             string `json:"enc"`         // base64std HPKE encapsulated key (32 bytes)
+	WrappedKey      string `json:"wrapped_key"` // base64std HPKE-wrapped AES-256 key (48 bytes)
+	BaseIV          string `json:"base_iv"`     // base64std 12-byte base IV; chunk i uses BaseIV+i (96-bit big-endian)
 	TotalChunks     int    `json:"total_chunks"`
 	PlaintextSHA256 string `json:"plaintext_sha256"` // hex SHA256 of assembled plaintext
 }
@@ -121,7 +172,7 @@ func (s *Server) HandleSubmit(w http.ResponseWriter, r *http.Request) {
 
 	rawKeycloakToken := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 	keycloakSub := extractKeycloakSub(rawKeycloakToken)
-	response := processJob(plaintext, keycloakSub, rawKeycloakToken)
+	response := s.processJob(plaintext, keycloakSub, rawKeycloakToken)
 
 	rid := r.Header.Get("X-Request-Id")
 	respAAD := []byte(fmt.Sprintf(`{"rid":%q,"ts":%d}`, rid, time.Now().Unix()))
@@ -140,42 +191,41 @@ func (s *Server) HandleSubmit(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// HandleUploadModel serves PUT /v1/upload/{job_id}/model.
-// Decrypts AES-256-GCM-CHUNKED-v1 stream, verifies SHA-256, forwards plaintext to Flask.
-func (s *Server) HandleUploadModel(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("job_id")
+// HandleUpload serves PUT /v1/upload/{job_id}/{slot} for every upload slot
+// (model, weights, adaptor — see jobs.Artifacts). It decrypts the
+// AES-256-GCM-CHUNKED-v1 stream and hands the plaintext to the job store,
+// which verifies the submit-time SHA-256 commitment and queues the job once
+// every expected slot is present.
+func (s *Server) HandleUpload(w http.ResponseWriter, r *http.Request) {
+	jobID, slot := r.PathValue("job_id"), r.PathValue("slot")
+	if _, ok := jobs.ArtifactBySlot(slot); !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"status": "error", "message": "unknown upload slot: " + slot})
+		return
+	}
 	plaintext, err := s.decryptChunkedUpload(r.Body, r.Header.Get("X-RATLS-Browser-HPKE"))
 	if err != nil {
-		log.Printf("model upload decrypt %s: %v", jobID, err)
+		log.Printf("%s upload decrypt %s: %v", slot, jobID, err)
 		http.Error(w, "decryption failed: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	proxyPlaintextUpload(w, bufferManagerURL+"/buffer/jobs/"+jobID+"/model", plaintext)
-}
-
-// HandleUploadWeights serves PUT /v1/upload/{job_id}/weights.
-func (s *Server) HandleUploadWeights(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("job_id")
-	plaintext, err := s.decryptChunkedUpload(r.Body, r.Header.Get("X-RATLS-Browser-HPKE"))
+	job, err := s.store.ReceiveArtifact(jobID, slot, plaintext)
 	if err != nil {
-		log.Printf("weights upload decrypt %s: %v", jobID, err)
-		http.Error(w, "decryption failed: "+err.Error(), http.StatusBadRequest)
+		code := http.StatusBadRequest
+		if strings.Contains(err.Error(), "unknown job_id") ||
+			errors.Is(err, jobs.ErrUnknownSlot) || errors.Is(err, jobs.ErrSlotNotAllowed) {
+			code = http.StatusNotFound
+		}
+		writeJSON(w, code, map[string]any{"status": "error", "message": err.Error()})
 		return
 	}
-	proxyPlaintextUpload(w, bufferManagerURL+"/buffer/jobs/"+jobID+"/weights", plaintext)
-}
-
-// HandleUploadPreprocessing serves PUT /v1/upload/{job_id}/preprocessing.
-// Decrypts the user's preprocessing.py and forwards plaintext to Flask.
-func (s *Server) HandleUploadPreprocessing(w http.ResponseWriter, r *http.Request) {
-	jobID := r.PathValue("job_id")
-	plaintext, err := s.decryptChunkedUpload(r.Body, r.Header.Get("X-RATLS-Browser-HPKE"))
-	if err != nil {
-		log.Printf("preprocessing upload decrypt %s: %v", jobID, err)
-		http.Error(w, "decryption failed: "+err.Error(), http.StatusBadRequest)
-		return
+	if job.Status == jobs.StatusQueued {
+		log.Printf("job %s all required files received — queued", jobID)
 	}
-	proxyPlaintextUpload(w, bufferManagerURL+"/buffer/jobs/"+jobID+"/preprocessing", plaintext)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": job.Status,
+		"job_id": jobID,
+		"bytes":  len(plaintext),
+	})
 }
 
 // decryptChunkedUpload reads and decrypts an AES-256-GCM-CHUNKED-v1 framed stream.
@@ -306,61 +356,37 @@ func (s *Server) decryptChunkedUpload(body io.Reader, browserPubB64u string) ([]
 	return assembled, nil
 }
 
-// proxyPlaintextUpload PUTs decrypted plaintext bytes to Flask.
-func proxyPlaintextUpload(w http.ResponseWriter, url string, data []byte) {
-	req, err := http.NewRequest(http.MethodPut, url, bytes.NewReader(data))
-	if err != nil {
-		http.Error(w, "proxy error", http.StatusInternalServerError)
-		return
-	}
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.ContentLength = int64(len(data))
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		log.Printf("upload proxy %s: %v", url, err)
-		http.Error(w, "buffer manager unavailable", http.StatusBadGateway)
-		return
-	}
-	defer resp.Body.Close()
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body) //nolint:errcheck
-}
-
-func processJob(plaintext []byte, keycloakSub string, keycloakToken string) []byte {
+// processJob creates the job record in the in-process store. The response
+// JSON shape is unchanged from the Flask era: {status, job_id, dataset_id}.
+func (s *Server) processJob(plaintext []byte, keycloakSub string, keycloakToken string) []byte {
 	var jobReq JobRequest
 	if err := json.Unmarshal(plaintext, &jobReq); err != nil {
 		return jsonErr("invalid job payload: " + err.Error())
 	}
-	if jobReq.DatasetID < 1 || jobReq.DatasetID > 3 {
-		return jsonErr("dataset_id must be 1, 2, or 3")
+	if err := jobReq.validate(); err != nil {
+		return jsonErr(err.Error())
 	}
 
-	flaskData := map[string]interface{}{
-		"dataset_id":      jobReq.DatasetID,
-		"model_sha256":    jobReq.ModelSHA256,
-		"weights_sha256":  jobReq.WeightsSHA256,
-		"submitted_by":    keycloakSub,
-		"keycloak_token":  keycloakToken,
-	}
-	if jobReq.PreprocessingSHA256 != "" {
-		flaskData["preprocessing_sha256"] = jobReq.PreprocessingSHA256
-	}
-	flaskPayload, _ := json.Marshal(flaskData)
-
-	resp, err := http.Post(bufferManagerURL+"/buffer/jobs", "application/json", //nolint:noctx
-		bytes.NewReader(flaskPayload))
+	job, err := s.store.Create(jobs.NewJobRequest{
+		DatasetID:     jobReq.DatasetID,
+		ModelFormat:   jobReq.ModelFormat,
+		ModelSHA256:   jobReq.ModelSHA256,
+		WeightsSHA256: jobReq.WeightsSHA256,
+		AdaptorSHA:    jobReq.AdaptorSHA256,
+		InputSpecSHA:  jobReq.InputSpecSHA256,
+		SubmittedBy:   keycloakSub,
+		KeycloakToken: keycloakToken,
+	})
 	if err != nil {
-		log.Printf("submit: buffer-manager: %v", err)
-		return jsonErr("buffer manager unavailable: " + err.Error())
+		return jsonErr(err.Error())
 	}
-	defer resp.Body.Close()
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	log.Printf("submit: buffer-manager %d", resp.StatusCode)
-	if resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusOK {
-		return jsonErr(fmt.Sprintf("buffer manager error %d: %s", resp.StatusCode, string(respBody)))
-	}
+	log.Printf("submit: job %s created (dataset %s, format %s)", job.JobID, job.DatasetID, job.ModelFormat)
+
+	respBody, _ := json.Marshal(map[string]any{
+		"status":     job.Status, // "pending_upload"
+		"job_id":     job.JobID,
+		"dataset_id": job.DatasetID,
+	})
 	return respBody
 }
 
