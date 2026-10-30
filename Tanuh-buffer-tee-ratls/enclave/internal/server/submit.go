@@ -38,6 +38,9 @@ type JobRequest struct {
 	ModelSHA256   string `json:"model_sha256"`             // .onnx / TorchScript .pt / Hugging Face .zip
 	WeightsSHA256 string `json:"weights_sha256,omitempty"` // ONNX external weights (.onnx.data), optional
 	AdaptorSHA256 string `json:"adaptor_sha256"`           // adaptor.py
+	// PreprocessingSHA256 commits to an optional preprocessing.py (ONNX /
+	// TorchScript): the model owner's input preparation.
+	PreprocessingSHA256 string `json:"preprocessing_sha256,omitempty"`
 	// InputSpecSHA256 commits to an optional input_spec.json (ONNX /
 	// TorchScript input size and resize method).
 	InputSpecSHA256 string `json:"input_spec_sha256,omitempty"`
@@ -64,6 +67,16 @@ func (r *JobRequest) validate() error {
 		}
 		if !isSHA256Hex(r.WeightsSHA256) {
 			return fmt.Errorf("weights_sha256 must be a 64-character hex SHA-256")
+		}
+	}
+	r.PreprocessingSHA256 = strings.ToLower(strings.TrimSpace(r.PreprocessingSHA256))
+	if r.PreprocessingSHA256 != "" {
+		if r.ModelFormat == jobs.FormatHuggingFace {
+			return fmt.Errorf("preprocessing_sha256 is only used with onnx and torchscript " +
+				"(Hugging Face models use their preprocessor_config.json)")
+		}
+		if !isSHA256Hex(r.PreprocessingSHA256) {
+			return fmt.Errorf("preprocessing_sha256 must be a 64-character hex SHA-256")
 		}
 	}
 	r.InputSpecSHA256 = strings.ToLower(strings.TrimSpace(r.InputSpecSHA256))
@@ -368,14 +381,15 @@ func (s *Server) processJob(plaintext []byte, keycloakSub string, keycloakToken 
 	}
 
 	job, err := s.store.Create(jobs.NewJobRequest{
-		DatasetID:     jobReq.DatasetID,
-		ModelFormat:   jobReq.ModelFormat,
-		ModelSHA256:   jobReq.ModelSHA256,
-		WeightsSHA256: jobReq.WeightsSHA256,
-		AdaptorSHA:    jobReq.AdaptorSHA256,
-		InputSpecSHA:  jobReq.InputSpecSHA256,
-		SubmittedBy:   keycloakSub,
-		KeycloakToken: keycloakToken,
+		DatasetID:        jobReq.DatasetID,
+		ModelFormat:      jobReq.ModelFormat,
+		ModelSHA256:      jobReq.ModelSHA256,
+		WeightsSHA256:    jobReq.WeightsSHA256,
+		AdaptorSHA:       jobReq.AdaptorSHA256,
+		PreprocessingSHA: jobReq.PreprocessingSHA256,
+		InputSpecSHA:     jobReq.InputSpecSHA256,
+		SubmittedBy:      keycloakSub,
+		KeycloakToken:    keycloakToken,
 	})
 	if err != nil {
 		return jsonErr(err.Error())

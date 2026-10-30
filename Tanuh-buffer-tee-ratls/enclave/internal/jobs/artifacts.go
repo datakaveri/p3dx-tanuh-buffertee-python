@@ -24,6 +24,11 @@ const (
 	SlotModel   = "model"   // .onnx / TorchScript .pt / Hugging Face .zip
 	SlotWeights = "weights" // ONNX external weights (.onnx.data), optional
 	SlotAdaptor = "adaptor" // adaptor.py: raw model outputs -> predictions.csv
+	// SlotPreprocessing is preprocessing.py: turns one dataset file into the
+	// model's input, replacing the Processing TEE's built-in resize/scaling.
+	// ONNX and TorchScript only (Hugging Face models use preprocessor_config.json).
+	// Optional.
+	SlotPreprocessing = "preprocessing"
 	// SlotInputSpec is input_spec.json: the model's input size / resize for
 	// ONNX and TorchScript (TorchScript files do not record their input size).
 	// Optional.
@@ -69,6 +74,12 @@ var artifactSpecs = []ArtifactSpec{
 		MaxBytes:       1 << 20,
 		allowed:        func(string) bool { return true },
 		commitment:     func(j *Job) string { return j.AdaptorSHA },
+	},
+	{
+		Slot:       SlotPreprocessing,
+		MaxBytes:   1 << 20,
+		allowed:    func(f string) bool { return f == FormatONNX || f == FormatTorchScript },
+		commitment: func(j *Job) string { return j.PreprocessingSHA },
 	},
 	{
 		Slot:       SlotInputSpec,

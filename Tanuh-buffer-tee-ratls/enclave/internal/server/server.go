@@ -27,7 +27,8 @@ func New(b *bundle.Builder, auth AuthConfig, store *jobs.Store, cfg config.Confi
 	s.mux.HandleFunc("GET /v1/attest", s.HandleAttest)
 	s.mux.HandleFunc("POST /v1/submit", s.HandleSubmit)
 	// Binary file upload — large files sent over TLS, hashes committed via HPKE.
-	// {slot} is model | weights | adaptor (jobs.Artifacts); anything else is 404.
+	// {slot} is model | weights | adaptor | preprocessing | input_spec
+	// (jobs.Artifacts); anything else is 404.
 	s.mux.HandleFunc("PUT /v1/upload/{job_id}/{slot}", s.HandleUpload)
 	s.mux.HandleFunc("GET /v1/status/{job_id}", s.HandleStatus)
 	s.mux.Handle("GET /v1/queue", requireRole("org_admin", http.HandlerFunc(s.HandleQueue)))

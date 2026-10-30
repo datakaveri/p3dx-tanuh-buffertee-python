@@ -129,9 +129,45 @@ func TestInputSpecSlot(t *testing.T) {
 	}
 }
 
+func TestPreprocessingSlot(t *testing.T) {
+	script := []byte("def preprocess(x):\n    return x\n")
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := s.Create(NewJobRequest{ModelFormat: FormatONNX, ModelSHA256: sha(modelBytes),
+		AdaptorSHA: sha(adaptorBytes), PreprocessingSHA: sha(script)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustReceive(t, s, job.JobID, SlotModel, modelBytes)
+	if got := mustReceive(t, s, job.JobID, SlotAdaptor, adaptorBytes).Status; got != StatusPendingUpload {
+		t.Fatalf("after model + adaptor: %s (preprocessing was committed, so still pending)", got)
+	}
+	if _, err := s.ReceiveArtifact(job.JobID, SlotPreprocessing, []byte("tampered")); err == nil {
+		t.Fatal("preprocessing.py with the wrong hash accepted")
+	}
+	if got := mustReceive(t, s, job.JobID, SlotPreprocessing, script).Status; got != StatusQueued {
+		t.Fatalf("after preprocessing: %s", got)
+	}
+	if got, _ := s.ArtifactBytes(job.JobID, SlotPreprocessing); !bytes.Equal(got, script) {
+		t.Fatalf("stored preprocessing %q", got)
+	}
+
+	// Not committed: refused; with Hugging Face: not a slot of that format.
+	s2, plain := newJob(t, FormatTorchScript, false)
+	if _, err := s2.ReceiveArtifact(plain.JobID, SlotPreprocessing, script); err == nil {
+		t.Fatal("uncommitted preprocessing accepted")
+	}
+	s3, hf := newJob(t, FormatHuggingFace, false)
+	if _, err := s3.ReceiveArtifact(hf.JobID, SlotPreprocessing, script); !errors.Is(err, ErrSlotNotAllowed) {
+		t.Fatalf("preprocessing on Hugging Face err=%v, want ErrSlotNotAllowed", err)
+	}
+}
+
 func TestUnknownSlotRejected(t *testing.T) {
 	s, job := newJob(t, FormatONNX, false)
-	for _, slot := range []string{"preprocessing", "model.onnx", "../job.json", ""} {
+	for _, slot := range []string{"python", "model.onnx", "../job.json", ""} {
 		if _, err := s.ReceiveArtifact(job.JobID, slot, adaptorBytes); !errors.Is(err, ErrUnknownSlot) {
 			t.Fatalf("slot %q: err=%v, want ErrUnknownSlot", slot, err)
 		}
@@ -186,7 +222,7 @@ func TestArtifactBytesBySlot(t *testing.T) {
 	if err != nil || !bytes.Equal(got, modelBytes) {
 		t.Fatalf("ArtifactBytes = %q, %v", got, err)
 	}
-	if _, err := s.ArtifactBytes(job.JobID, "preprocessing"); !errors.Is(err, ErrUnknownSlot) {
+	if _, err := s.ArtifactBytes(job.JobID, "python"); !errors.Is(err, ErrUnknownSlot) {
 		t.Fatalf("unknown slot read: %v", err)
 	}
 }

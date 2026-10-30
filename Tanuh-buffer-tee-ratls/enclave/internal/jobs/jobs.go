@@ -50,6 +50,7 @@ type Job struct {
 	ModelSHA256        string         `json:"model_sha256_expected"`
 	WeightsSHA256      string         `json:"weights_sha256_expected"`
 	AdaptorSHA         string         `json:"adaptor_sha256_expected"`
+	PreprocessingSHA   string         `json:"preprocessing_sha256_expected,omitempty"`
 	InputSpecSHA       string         `json:"input_spec_sha256_expected,omitempty"`
 	Notes              string         `json:"notes"`
 	GPUAttempts        int            `json:"gpu_provision_attempts,omitempty"`
@@ -110,16 +111,17 @@ func (s *Store) ResultsPath(jobID string) string {
 
 // NewJobRequest carries the validated fields from /v1/submit.
 type NewJobRequest struct {
-	DatasetID       string
-	ModelFormat     string
-	ModelSHA256     string
-	WeightsSHA256   string
-	AdaptorSHA      string
-	InputSpecSHA    string
-	SubmittedBy     string
-	KeycloakToken   string
-	Hyperparameters map[string]any
-	Notes           string
+	DatasetID        string
+	ModelFormat      string
+	ModelSHA256      string
+	WeightsSHA256    string
+	AdaptorSHA       string
+	PreprocessingSHA string
+	InputSpecSHA     string
+	SubmittedBy      string
+	KeycloakToken    string
+	Hyperparameters  map[string]any
+	Notes            string
 }
 
 // Create makes a new pending_upload job record.
@@ -142,21 +144,22 @@ func (s *Store) Create(req NewJobRequest) (*Job, error) {
 		hp = map[string]any{}
 	}
 	job := &Job{
-		JobID:           jobID,
-		Status:          StatusPendingUpload,
-		DatasetID:       req.DatasetID,
-		SubmittedAtUnix: now,
-		UpdatedAtUnix:   now,
-		Hyperparameters: hp,
-		ModelFormat:     req.ModelFormat,
-		ArtifactDir:     filepath.Join(dir, "artifacts"),
-		SubmittedBy:     orDefault(req.SubmittedBy, "unknown"),
-		KeycloakToken:   req.KeycloakToken,
-		ModelSHA256:     strings.ToLower(req.ModelSHA256),
-		WeightsSHA256:   strings.ToLower(req.WeightsSHA256),
-		AdaptorSHA:      strings.ToLower(req.AdaptorSHA),
-		InputSpecSHA:    strings.ToLower(req.InputSpecSHA),
-		Notes:           req.Notes,
+		JobID:            jobID,
+		Status:           StatusPendingUpload,
+		DatasetID:        req.DatasetID,
+		SubmittedAtUnix:  now,
+		UpdatedAtUnix:    now,
+		Hyperparameters:  hp,
+		ModelFormat:      req.ModelFormat,
+		ArtifactDir:      filepath.Join(dir, "artifacts"),
+		SubmittedBy:      orDefault(req.SubmittedBy, "unknown"),
+		KeycloakToken:    req.KeycloakToken,
+		ModelSHA256:      strings.ToLower(req.ModelSHA256),
+		WeightsSHA256:    strings.ToLower(req.WeightsSHA256),
+		AdaptorSHA:       strings.ToLower(req.AdaptorSHA),
+		PreprocessingSHA: strings.ToLower(req.PreprocessingSHA),
+		InputSpecSHA:     strings.ToLower(req.InputSpecSHA),
+		Notes:            req.Notes,
 	}
 	if err := s.saveLocked(job); err != nil {
 		return nil, err

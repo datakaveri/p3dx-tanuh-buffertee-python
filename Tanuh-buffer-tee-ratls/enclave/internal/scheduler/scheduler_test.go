@@ -41,6 +41,9 @@ func queuedJob(t *testing.T, format string, files map[string][]byte) (*Scheduler
 	if spec, ok := files[jobs.SlotInputSpec]; ok {
 		req.InputSpecSHA = sha(spec)
 	}
+	if script, ok := files[jobs.SlotPreprocessing]; ok {
+		req.PreprocessingSHA = sha(script)
+	}
 	job, err := store.Create(req)
 	if err != nil {
 		t.Fatal(err)
@@ -67,9 +70,10 @@ func decode(t *testing.T, raw []byte) map[string]any {
 
 func TestBuildPayloadV2Shape(t *testing.T) {
 	files := map[string][]byte{
-		jobs.SlotModel:   []byte("onnx-graph"),
-		jobs.SlotWeights: []byte("onnx-weights"),
-		jobs.SlotAdaptor: []byte("adaptor.py"),
+		jobs.SlotModel:         []byte("onnx-graph"),
+		jobs.SlotWeights:       []byte("onnx-weights"),
+		jobs.SlotAdaptor:       []byte("adaptor.py"),
+		jobs.SlotPreprocessing: []byte("preprocessing.py"),
 	}
 	s, job := queuedJob(t, jobs.FormatONNX, files)
 	raw, err := s.buildPayload(job)
@@ -95,6 +99,9 @@ func TestBuildPayloadV2Shape(t *testing.T) {
 		t.Fatalf("buffer_job_url %v", p["buffer_job_url"])
 	}
 	arts := p["artifacts"].(map[string]any)
+	if len(arts) != len(files) {
+		t.Fatalf("artifacts %v, want exactly the %d uploaded", mapKeys(arts), len(files))
+	}
 	for slot, data := range files {
 		a := arts[slot].(map[string]any)
 		got, _ := base64.StdEncoding.DecodeString(a["base64"].(string))
@@ -148,4 +155,13 @@ func TestBuildPayloadRejectsArtifactChangedOnDisk(t *testing.T) {
 	if _, err := s.buildPayload(job); err == nil || !strings.Contains(err.Error(), "submit-time SHA-256") {
 		t.Fatalf("tampered artifact dispatched: %v", err)
 	}
+}
+
+func mapKeys(m map[string]any) []string {
+	var out []string
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }

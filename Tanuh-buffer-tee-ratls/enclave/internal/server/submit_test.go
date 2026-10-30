@@ -28,6 +28,10 @@ func TestJobRequestValidate(t *testing.T) {
 		{"onnx with input spec", JobRequest{ModelFormat: "onnx", ModelSHA256: hex64, AdaptorSHA256: hex64, InputSpecSHA256: hex64}, ""},
 		{"input spec on huggingface", JobRequest{ModelFormat: "huggingface", ModelSHA256: hex64, AdaptorSHA256: hex64, InputSpecSHA256: hex64}, "only used with onnx and torchscript"},
 		{"malformed input spec hash", JobRequest{ModelFormat: "onnx", ModelSHA256: hex64, AdaptorSHA256: hex64, InputSpecSHA256: "x"}, "input_spec_sha256"},
+		{"onnx with all four files", JobRequest{ModelFormat: "onnx", ModelSHA256: hex64, WeightsSHA256: hex64, AdaptorSHA256: hex64, PreprocessingSHA256: hex64}, ""},
+		{"torchscript with preprocessing", JobRequest{ModelFormat: "torchscript", ModelSHA256: hex64, AdaptorSHA256: hex64, PreprocessingSHA256: strings.ToUpper(hex64)}, ""},
+		{"preprocessing on huggingface", JobRequest{ModelFormat: "huggingface", ModelSHA256: hex64, AdaptorSHA256: hex64, PreprocessingSHA256: hex64}, "only used with onnx and torchscript"},
+		{"malformed preprocessing hash", JobRequest{ModelFormat: "onnx", ModelSHA256: hex64, AdaptorSHA256: hex64, PreprocessingSHA256: "x"}, "preprocessing_sha256"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

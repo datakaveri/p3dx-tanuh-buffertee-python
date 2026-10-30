@@ -9,7 +9,7 @@ The runtime is a **single static Go binary** (`buffer-tee`) in a distroless imag
 ```
 Browser
   │  HPKE-encrypted metadata   (POST /v1/submit)
-  │  AES-256-GCM chunked files (PUT  /v1/upload/:job_id/model|weights|adaptor)
+  │  AES-256-GCM chunked files (PUT  /v1/upload/:job_id/model|weights|adaptor|preprocessing|input_spec)
   ▼
 buffer-tee (Go, :8443, TLS 1.3, Keycloak JWT)
   ├─ HPKE / AES-GCM decrypt + SHA-256 verification
@@ -26,10 +26,12 @@ buffer-tee (Go, :8443, TLS 1.3, Keycloak JWT)
 
 ## Job lifecycle
 
-1. Browser POSTs HPKE-encrypted `{dataset_id, model_format, model_sha256, adaptor_sha256[, weights_sha256][, input_spec_sha256]}` → job `pending_upload`.
+1. Browser POSTs HPKE-encrypted `{dataset_id, model_format, model_sha256, adaptor_sha256[, weights_sha256][, preprocessing_sha256][, input_spec_sha256]}` → job `pending_upload`.
    `model_format` is `onnx`, `torchscript` or `huggingface`; `weights_sha256` (the `.onnx.data` file) is ONNX-only and optional;
    `input_spec_sha256` (an `input_spec.json` giving the input size / resize, e.g. `{"input_size": [224, 224], "resize": "bicubic"}`)
    is optional for ONNX and TorchScript. A TorchScript model needs it unless the size is embedded in the `.pt`.
+   `preprocessing_sha256` (a `preprocessing.py` whose `preprocess(x)` turns one dataset file into the model's input,
+   replacing the Processing TEE's built-in resize/scaling) is optional for ONNX and TorchScript.
 2. Encrypted chunked uploads, one per slot (see `internal/jobs/artifacts.go`); each must match its submit-time SHA-256 — a slot with no commitment accepts nothing → `queued` once every expected slot is present
 
    | Slot | onnx | torchscript | huggingface |
@@ -37,6 +39,7 @@ buffer-tee (Go, :8443, TLS 1.3, Keycloak JWT)
    | `model` | `.onnx` (required) | `.pt` (required) | `.zip` (required) |
    | `weights` | `.onnx.data` (if committed) | — | — |
    | `adaptor` | `adaptor.py` (required) | `adaptor.py` (required) | `adaptor.py` (required) |
+   | `preprocessing` | `preprocessing.py` (if committed) | `preprocessing.py` (if committed) | — |
    | `input_spec` | `input_spec.json` (if committed) | `input_spec.json` (if committed) | — |
 3. Scheduler re-checks every stored artifact against its commitment (a mismatch fails the job), provisions a Processing TEE (GPU attempts → CPU fallback) and dispatches payload v2 over RA-TLS → `dispatched`
 4. Processing TEE runs the eval, submits results to the leaderboard, then POSTs its terminal status here → `complete` or `error` (with the classified failure)
@@ -48,7 +51,7 @@ buffer-tee (Go, :8443, TLS 1.3, Keycloak JWT)
 |---|---|---|---|
 | `GET` | `/v1/attest` | Keycloak JWT | RA-TLS attestation bundle (OIDC token + HPKE pub + liveness sig) |
 | `POST` | `/v1/submit` | Keycloak JWT | HPKE-encrypted job metadata → `{job_id}` |
-| `PUT` | `/v1/upload/:job_id/:slot` | Keycloak JWT | AES-256-GCM chunked upload; `slot` = `model` \| `weights` \| `adaptor` \| `input_spec` (anything else, or a slot the model format doesn't use, is 404) |
+| `PUT` | `/v1/upload/:job_id/:slot` | Keycloak JWT | AES-256-GCM chunked upload; `slot` = `model` \| `weights` \| `adaptor` \| `preprocessing` \| `input_spec` (anything else, or a slot the model format doesn't use, is 404) |
 | `GET` | `/v1/status/:job_id` | Keycloak JWT | Job record |
 | `GET` | `/v1/queue` | Keycloak JWT + `org_admin` | All jobs + queue |
 | `GET` | `/v1/results/:job_id` | Keycloak JWT | Job status (results live on the leaderboard) |
