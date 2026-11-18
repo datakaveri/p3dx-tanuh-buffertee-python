@@ -57,46 +57,6 @@ DISPATCH_STATE_FILE         = BUFFER_RUNTIME_DIR / "dispatch_state.json"
 MODEL_FILE_NAME          = "model.onnx"
 WEIGHTS_FILE_NAME        = "model.onnx.data"
 PREPROCESSING_FILE_NAME  = "preprocessing.py"
-TORCHSCRIPT_MODEL_FILE_NAME = "model.pt"
-
-# Model formats (same names as the new Buffer TEE). Jobs without a
-# model_format are ONNX, so existing clients keep working.
-FORMAT_ONNX        = "onnx"
-FORMAT_TORCHSCRIPT = "torchscript"
-MODEL_FILE_BY_FORMAT = {
-    FORMAT_ONNX:        MODEL_FILE_NAME,
-    FORMAT_TORCHSCRIPT: TORCHSCRIPT_MODEL_FILE_NAME,
-}
-
-# Upload slots: size limit, submit-time commitment and which model formats use
-# them, as in the new Buffer TEE (internal/jobs/artifacts.go). The weights slot
-# (model.onnx.data, external ONNX weights) is optional and ONNX-only: it is
-# expected only if weights_sha256 was committed.
-ARTIFACT_SPECS = {
-    "model":         {"max_bytes": 4 << 30, "commitment": "model_sha256_expected",
-                      "always_required": True,  "formats": (FORMAT_ONNX, FORMAT_TORCHSCRIPT)},
-    "weights":       {"max_bytes": 4 << 30, "commitment": "weights_sha256_expected",
-                      "always_required": False, "formats": (FORMAT_ONNX,)},
-    "preprocessing": {"max_bytes": 1 << 20, "commitment": "preprocessing_sha256_expected",
-                      "always_required": False, "formats": (FORMAT_ONNX, FORMAT_TORCHSCRIPT)},
-}
-
-
-class SlotNotAllowed(ValueError):
-    """The upload slot is not used by the job's model format."""
-
-
-def _job_model_format(job):
-    return job.get("model_format") or FORMAT_ONNX
-
-
-def _artifact_file(job, slot):
-    """File name an upload slot is stored under for this job."""
-    if slot == "model":
-        return job.get("model_file") or MODEL_FILE_BY_FORMAT[_job_model_format(job)]
-    if slot == "weights":
-        return WEIGHTS_FILE_NAME
-    return PREPROCESSING_FILE_NAME
 
 BUFFER_TEE_HOST  = os.getenv("BUFFER_TEE_HOST",  "0.0.0.0")
 BUFFER_TEE_PORT  = int(os.getenv("BUFFER_TEE_PORT", "4100"))
@@ -292,16 +252,10 @@ def _create_job_record(content):
     Create a job from metadata. Model files are uploaded separately.
 
     Required: dataset_id
-    Optional: model_sha256, weights_sha256, submitted_by,
-              model_format (onnx | torchscript, default onnx)
+    Optional: model_sha256, weights_sha256, submitted_by
     """
     _ensure_dirs()
     dataset_id = _canonical_dataset_id(content.get("dataset_id", 1))
-    model_format = (content.get("model_format") or FORMAT_ONNX).strip().lower()
-    if model_format not in MODEL_FILE_BY_FORMAT:
-        raise ValueError(f"model_format must be one of onnx, torchscript (got {model_format!r})")
-    if content.get("weights_sha256") and model_format != FORMAT_ONNX:
-        raise ValueError("weights_sha256 is only used with model_format onnx")
     job_id     = content.get("job_id") or f"job-{uuid.uuid4().hex[:12]}"
     job_dir    = _job_dir(job_id)
 
@@ -318,8 +272,7 @@ def _create_job_record(content):
         "submitted_at_unix": int(time.time()),
         "updated_at_unix":   int(time.time()),
         "hyperparameters":   content.get("hyperparameters", {}),
-        "model_format":      model_format,
-        "model_file":        MODEL_FILE_BY_FORMAT[model_format],
+        "model_file":        MODEL_FILE_NAME,
         "weights_file":      WEIGHTS_FILE_NAME,
         "artifact_dir":      str(job_dir / "artifacts"),
         "submitted_by":      content.get("submitted_by", "unknown"),
@@ -333,45 +286,45 @@ def _create_job_record(content):
     return job  # NOT queued yet — queued after files arrive
 
 
-def _receive_artifact(job_id, slot, data: bytes):
-    """Write an uploaded artifact (slot: model | weights | preprocessing) and
-    queue the job when all required files are present."""
+def _receive_artifact(job_id, artifact_name, data: bytes):
+    """Write a binary artifact and queue the job when all required files are present."""
     _ensure_dirs()
     job = _load_job(job_id)
     if job["status"] not in ("pending_upload",):
         raise ValueError(f"Job {job_id} is not awaiting upload (status={job['status']})")
 
-    spec = ARTIFACT_SPECS.get(slot)
-    if spec is None:
-        raise ValueError(f"Unknown upload slot: {slot}")
-    model_format = _job_model_format(job)
-    if model_format not in spec["formats"]:
-        raise SlotNotAllowed(f"artifact slot not used by this model format: {slot} for {model_format}")
-    artifact_name = _artifact_file(job, slot)
-
-    sha256_expected = job.get(spec["commitment"], "")
-    if not sha256_expected:
-        raise ValueError(f"no SHA-256 was committed for {artifact_name} at submit")
-    if len(data) > spec["max_bytes"]:
-        raise ValueError(
-            f"{artifact_name} is {len(data)} bytes, over the {spec['max_bytes']}-byte limit"
-        )
-    if hashlib.sha256(data).hexdigest() != sha256_expected:
-        raise ValueError(f"SHA256 mismatch for {artifact_name}")
+    allowed = {MODEL_FILE_NAME, WEIGHTS_FILE_NAME, PREPROCESSING_FILE_NAME}
+    if artifact_name not in allowed:
+        raise ValueError(f"Unknown artifact name: {artifact_name}")
 
     artifacts_dir = Path(job["artifact_dir"])
     artifacts_dir.mkdir(parents=True, exist_ok=True)
-    (artifacts_dir / artifact_name).write_bytes(data)
+    path = artifacts_dir / artifact_name
+    path.write_bytes(data)
+
+    sha256_actual = hashlib.sha256(data).hexdigest()
+    sha256_key_map = {
+        MODEL_FILE_NAME:         "model_sha256_expected",
+        WEIGHTS_FILE_NAME:       "weights_sha256_expected",
+        PREPROCESSING_FILE_NAME: "preprocessing_sha256_expected",
+    }
+    sha256_expected = job.get(sha256_key_map[artifact_name], "")
+    if sha256_expected and sha256_actual != sha256_expected:
+        raise ValueError(
+            f"SHA256 mismatch for {artifact_name}: "
+            f"expected {sha256_expected}, got {sha256_actual}"
+        )
 
     job["updated_at_unix"] = int(time.time())
 
-    # Queue once every expected artifact is present: the model always, the
-    # others only if their hash was committed in /v1/submit.
-    all_required = all(
-        (artifacts_dir / _artifact_file(job, name)).exists()
-        for name, s in ARTIFACT_SPECS.items()
-        if model_format in s["formats"] and (s["always_required"] or job.get(s["commitment"], ""))
-    )
+    # If the client committed to a preprocessing hash in /v1/submit, wait for
+    # preprocessing.py before queuing — regardless of dataset_id.
+    model_path         = artifacts_dir / MODEL_FILE_NAME
+    weights_path       = artifacts_dir / WEIGHTS_FILE_NAME
+    preprocessing_path = artifacts_dir / PREPROCESSING_FILE_NAME
+    all_required = model_path.exists() and weights_path.exists()
+    if all_required and job.get("preprocessing_sha256_expected", ""):
+        all_required = preprocessing_path.exists()
 
     if all_required:
         job["status"] = "queued"
@@ -388,7 +341,7 @@ def _receive_artifact(job_id, slot, data: bytes):
 # ── Artifact serving ──────────────────────────────────────────────────────────
 
 def _artifact_path(job_id, artifact_name):
-    allowed = {MODEL_FILE_NAME, TORCHSCRIPT_MODEL_FILE_NAME, WEIGHTS_FILE_NAME, PREPROCESSING_FILE_NAME}
+    allowed = {MODEL_FILE_NAME, WEIGHTS_FILE_NAME, PREPROCESSING_FILE_NAME}
     if artifact_name not in allowed:
         raise FileNotFoundError(f"Unknown artifact: {artifact_name}")
     path = _job_dir(job_id) / "artifacts" / artifact_name
@@ -685,11 +638,8 @@ def _buffer_url(path):
 
 
 def _build_secure_dispatch_payload(job):
-    model_format  = _job_model_format(job)
-    model_file    = _artifact_file(job, "model")
-    model_bytes   = _artifact_bytes(job["job_id"], model_file)
-    weights_path  = Path(job["artifact_dir"]) / WEIGHTS_FILE_NAME
-    weights_bytes = weights_path.read_bytes() if weights_path.exists() else None
+    model_bytes   = _artifact_bytes(job["job_id"], MODEL_FILE_NAME)
+    weights_bytes = _artifact_bytes(job["job_id"], WEIGHTS_FILE_NAME)
     payload = {
         "job_id":            job["job_id"],
         "dataset_id":        job["dataset_id"],
@@ -697,18 +647,14 @@ def _build_secure_dispatch_payload(job):
         "submitted_by":      job.get("submitted_by", ""),
         "keycloak_token":    job.get("keycloak_token", ""),
         "hyperparameters":   job["hyperparameters"],
-        "model_format":      model_format,
-        "model_file":        model_file,
+        "model_file":        MODEL_FILE_NAME,
+        "weights_file":      WEIGHTS_FILE_NAME,
         "model_sha256":      hashlib.sha256(model_bytes).hexdigest(),
-        # Field name kept for wire compatibility; for TorchScript it carries model.pt.
+        "weights_sha256":    hashlib.sha256(weights_bytes).hexdigest(),
         "model_onnx_base64":    base64.b64encode(model_bytes).decode(),
+        "model_weights_base64": base64.b64encode(weights_bytes).decode(),
         "buffer_job_url":    _buffer_url(f"/buffer/jobs/{job['job_id']}"),
     }
-    # External ONNX weights are optional (only sent when uploaded).
-    if weights_bytes is not None:
-        payload["weights_file"]         = WEIGHTS_FILE_NAME
-        payload["weights_sha256"]       = hashlib.sha256(weights_bytes).hexdigest()
-        payload["model_weights_base64"] = base64.b64encode(weights_bytes).decode()
     # Include preprocessing script for Oral Cancer jobs
     preprocessing_path = Path(job["artifact_dir"]) / PREPROCESSING_FILE_NAME
     if preprocessing_path.exists():
@@ -949,13 +895,11 @@ def upload_model(job_id):
     if not data:
         return jsonify({"status": "error", "message": "empty body"}), 400
     try:
-        job = _receive_artifact(job_id, "model", data)
+        job = _receive_artifact(job_id, MODEL_FILE_NAME, data)
         return jsonify({"status": job["status"], "job_id": job_id,
                         "bytes": len(data)}), 200
     except FileNotFoundError:
         return jsonify({"status": "error", "message": "Unknown job_id"}), 404
-    except SlotNotAllowed as exc:
-        return jsonify({"status": "error", "message": str(exc)}), 404
     except Exception as exc:
         return jsonify({"status": "error", "message": str(exc)}), 400
 
@@ -967,13 +911,11 @@ def upload_weights(job_id):
     if not data:
         return jsonify({"status": "error", "message": "empty body"}), 400
     try:
-        job = _receive_artifact(job_id, "weights", data)
+        job = _receive_artifact(job_id, WEIGHTS_FILE_NAME, data)
         return jsonify({"status": job["status"], "job_id": job_id,
                         "bytes": len(data)}), 200
     except FileNotFoundError:
         return jsonify({"status": "error", "message": "Unknown job_id"}), 404
-    except SlotNotAllowed as exc:
-        return jsonify({"status": "error", "message": str(exc)}), 404
     except Exception as exc:
         return jsonify({"status": "error", "message": str(exc)}), 400
 
@@ -985,13 +927,11 @@ def upload_preprocessing(job_id):
     if not data:
         return jsonify({"status": "error", "message": "empty body"}), 400
     try:
-        job = _receive_artifact(job_id, "preprocessing", data)
+        job = _receive_artifact(job_id, PREPROCESSING_FILE_NAME, data)
         return jsonify({"status": job["status"], "job_id": job_id,
                         "bytes": len(data)}), 200
     except FileNotFoundError:
         return jsonify({"status": "error", "message": "Unknown job_id"}), 404
-    except SlotNotAllowed as exc:
-        return jsonify({"status": "error", "message": str(exc)}), 404
     except Exception as exc:
         return jsonify({"status": "error", "message": str(exc)}), 400
 

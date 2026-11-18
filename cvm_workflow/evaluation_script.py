@@ -46,7 +46,7 @@ def main():
     if external_weights.exists():
         debug(f"External weights SHA256={sha256_file(external_weights)}")
     else:
-        debug("No external weights file; weights are embedded in model.onnx")
+        raise FileNotFoundError(f"External weights file missing: {external_weights}")
 
     session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
     input_meta = session.get_inputs()[0]

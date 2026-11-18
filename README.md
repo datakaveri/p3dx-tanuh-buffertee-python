@@ -51,8 +51,8 @@ Internal Flask endpoints (`:4100`, not exposed externally): `POST /buffer/jobs`,
 
 ## Job Lifecycle
 
-1. Browser POSTs HPKE-encrypted `{ dataset_id, model_format, model_sha256, weights_sha256 }` → job record created (`status: pending`). `model_format` is `onnx` (default when absent) or `torchscript` (a PyTorch model saved with `torch.jit.save`, stored as `model.pt`; it has no weights file, so `weights_sha256` and the weights upload are rejected for it)
-2. Browser uploads model, weights, and optionally a preprocessing script via AES-256-GCM chunked PUTs. Each upload must match its submit-time SHA-256 (a file with no commitment is rejected) and fit its limit: model 4 GiB, weights 4 GiB, preprocessing 1 MiB. The weights file (`model.onnx.data`, ONNX external data for models over 2 GB) is optional: it is expected only if `weights_sha256` was committed
+1. Browser POSTs HPKE-encrypted `{ dataset_id, model_sha256, weights_sha256 }` → job record created (`status: pending`)
+2. Browser uploads model, weights, and optionally a preprocessing script via AES-256-GCM chunked PUTs
 3. Once all required files arrive and SHA-256 hashes verify → `status: queued`, appended to `queue.json`
 4. Scheduler picks next queued job → attempts GPU TEE → falls back to CPU TEE if unavailable
 5. Encrypted payload dispatched to Processing TEE over RA-TLS → `status: dispatched`
