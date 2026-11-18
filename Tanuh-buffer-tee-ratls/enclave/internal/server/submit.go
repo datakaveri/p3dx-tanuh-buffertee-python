@@ -34,7 +34,14 @@ type JobRequest struct {
 	ModelSHA256         string `json:"model_sha256"`             // hex SHA256 of model.onnx plaintext
 	WeightsSHA256       string `json:"weights_sha256"`           // hex SHA256 of weights plaintext
 	PreprocessingSHA256 string `json:"preprocessing_sha256,omitempty"` // hex SHA256 of preprocessing.py (dataset_id=2)
+	ModelFormat         string `json:"model_format,omitempty"`         // onnx (default) | torchscript
 }
+
+// Model formats a submission can declare (same names as the new Buffer TEE).
+const (
+	formatONNX        = "onnx"
+	formatTorchScript = "torchscript"
+)
 
 // extractKeycloakSub decodes the JWT payload (already validated by middleware)
 // and returns the "sub" claim, or empty string on any error.
@@ -336,6 +343,16 @@ func processJob(plaintext []byte, keycloakSub string, keycloakToken string) []by
 	if jobReq.DatasetID < 1 || jobReq.DatasetID > 3 {
 		return jsonErr("dataset_id must be 1, 2, or 3")
 	}
+	jobReq.ModelFormat = strings.ToLower(strings.TrimSpace(jobReq.ModelFormat))
+	if jobReq.ModelFormat == "" {
+		jobReq.ModelFormat = formatONNX
+	}
+	if jobReq.ModelFormat != formatONNX && jobReq.ModelFormat != formatTorchScript {
+		return jsonErr(fmt.Sprintf("model_format must be one of onnx, torchscript (got %q)", jobReq.ModelFormat))
+	}
+	if jobReq.WeightsSHA256 != "" && jobReq.ModelFormat != formatONNX {
+		return jsonErr("weights_sha256 is only used with model_format onnx")
+	}
 
 	flaskData := map[string]interface{}{
 		"dataset_id":      jobReq.DatasetID,
@@ -343,6 +360,7 @@ func processJob(plaintext []byte, keycloakSub string, keycloakToken string) []by
 		"weights_sha256":  jobReq.WeightsSHA256,
 		"submitted_by":    keycloakSub,
 		"keycloak_token":  keycloakToken,
+		"model_format":    jobReq.ModelFormat,
 	}
 	if jobReq.PreprocessingSHA256 != "" {
 		flaskData["preprocessing_sha256"] = jobReq.PreprocessingSHA256
